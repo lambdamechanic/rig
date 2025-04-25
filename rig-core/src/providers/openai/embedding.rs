@@ -5,7 +5,7 @@ use reqwest::{header::HeaderValue, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::sleep; // Already present, no change needed here, but confirming it's used.
 
 // ================================================================
 // OpenAI Embedding API
@@ -161,47 +161,77 @@ fn parse_ratelimit_duration(header_value: &HeaderValue) -> Option<Duration> {
     header_value.to_str().ok().and_then(|s| {
         let mut total_duration = Duration::ZERO;
         let mut current_value = String::new();
+        let mut chars = s.chars().peekable();
 
-        for c in s.chars() {
-            if c.is_ascii_digit() {
+        while let Some(c) = chars.next() {
+            if c.is_ascii_digit() || (c == '.' && current_value.contains('.')) { // Allow digits and a single decimal point for potential future float seconds
                 current_value.push(c);
             } else if c.is_alphabetic() {
-                if let Ok(val) = current_value.parse::<u64>() {
-                    match c {
-                        'h' => total_duration += Duration::from_secs(val * 3600),
-                        'm' => {
-                            // Check if the next char is 's' for 'ms'
-                            if s.chars().skip_while(|&x| x != 'm').nth(1) == Some('s') {
-                                // Skip 's' processing later
-                            } else {
-                                total_duration += Duration::from_secs(val * 60);
+                // Handle unit
+                let unit = match chars.peek() {
+                    Some(&next_char) if c == 'm' && next_char == 's' => {
+                        chars.next(); // Consume 's'
+                        "ms"
+                    }
+                    _ => {
+                        // Single character unit
+                        match c {
+                            'h' => "h",
+                            'm' => "m",
+                            's' => "s",
+                            _ => {
+                                // Unknown unit, skip value
+                                tracing::warn!(target: "rig", "Unknown unit '{}' in rate limit duration '{}'", c, s);
+                                current_value.clear();
+                                continue;
                             }
                         }
-                        's' => {
-                            // Check if previous char was 'm' for 'ms'
-                            if s.chars().rev().skip_while(|&x| x != 's').nth(1) == Some('m') {
-                                total_duration += Duration::from_millis(val);
-                            } else {
-                                total_duration += Duration::from_secs(val);
-                            }
-                        }
-                        _ => { /* ignore unknown units */ }
+                    }
+                };
+
+                if let Ok(val) = current_value.parse::<f64>() { // Use f64 for potential fractional seconds
+                    match unit {
+                        "h" => total_duration += Duration::from_secs_f64(val * 3600.0),
+                        "m" => total_duration += Duration::from_secs_f64(val * 60.0),
+                        "s" => total_duration += Duration::from_secs_f64(val),
+                        "ms" => total_duration += Duration::from_secs_f64(val / 1000.0),
+                        _ => unreachable!(), // Should be handled above
                     }
                     current_value.clear();
-                } else {
+                } else if !current_value.is_empty() {
                     // Failed to parse number part
-                    return None;
+                    tracing::warn!(target: "rig", "Failed to parse value '{}' in rate limit duration '{}'", current_value, s);
+                    return None; // Indicate parsing failure
                 }
+                // else: current_value was empty, likely consecutive units or leading unit, ignore
+            } else {
+                 // Ignore other characters like whitespace
+                 if !c.is_whitespace() {
+                    tracing::warn!(target: "rig", "Unexpected character '{}' in rate limit duration '{}'", c, s);
+                 }
             }
         }
 
+         // Handle trailing number without unit (treat as seconds, though OpenAI likely always includes units)
+        if !current_value.is_empty() {
+             if let Ok(val) = current_value.parse::<f64>() {
+                 tracing::warn!(target: "rig", "Trailing number '{}' in rate limit duration '{}', assuming seconds.", val, s);
+                 total_duration += Duration::from_secs_f64(val);
+             } else {
+                 tracing::warn!(target: "rig", "Failed to parse trailing value '{}' in rate limit duration '{}'", current_value, s);
+                 return None;
+             }
+        }
+
+
         if total_duration == Duration::ZERO {
-            None // No valid units found or parsed
+            None // No valid duration parsed
         } else {
             Some(total_duration)
         }
     })
 }
+
 
 impl EmbeddingModel {
     pub fn new(client: Client, model: &str, ndims: usize) -> Self {
