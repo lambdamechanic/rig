@@ -70,9 +70,15 @@ impl embeddings::EmbeddingModel for EmbeddingModel {
         let request_body = json!({
             "model": self.model,
             "input": documents_vec,
+            "input": documents_vec,
         });
 
         loop {
+            tracing::debug!(target: "rig",
+                "Sending OpenAI embedding request for {} documents with model '{}'",
+                documents_vec.len(),
+                self.model
+            );
             let response = self
                 .client
                 .post("/embeddings")
@@ -80,7 +86,10 @@ impl embeddings::EmbeddingModel for EmbeddingModel {
                 .send()
                 .await?;
 
-            match response.status() {
+            let status = response.status();
+            tracing::debug!(target: "rig", "Received OpenAI embedding response status: {}", status);
+
+            match status {
                 StatusCode::OK => {
                     // Success case
                     match response.json::<ApiResponse<EmbeddingResponse>>().await? {
