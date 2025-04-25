@@ -1,8 +1,11 @@
 use super::{ApiErrorResponse, ApiResponse, Client, Usage};
 use crate::embeddings;
 use crate::embeddings::EmbeddingError;
+use reqwest::{header::HeaderValue, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
+use std::time::Duration;
+use tokio::time::sleep;
 
 // ================================================================
 // OpenAI Embedding API
@@ -63,48 +66,141 @@ impl embeddings::EmbeddingModel for EmbeddingModel {
         &self,
         documents: impl IntoIterator<Item = String>,
     ) -> Result<Vec<embeddings::Embedding>, EmbeddingError> {
-        let documents = documents.into_iter().collect::<Vec<_>>();
+        let documents_vec = documents.into_iter().collect::<Vec<_>>();
+        let request_body = json!({
+            "model": self.model,
+            "input": documents_vec,
+        });
 
-        let response = self
-            .client
-            .post("/embeddings")
-            .json(&json!({
-                "model": self.model,
-                "input": documents,
-            }))
-            .send()
-            .await?;
+        loop {
+            let response = self
+                .client
+                .post("/embeddings")
+                .json(&request_body)
+                .send()
+                .await?;
 
-        if response.status().is_success() {
-            match response.json::<ApiResponse<EmbeddingResponse>>().await? {
-                ApiResponse::Ok(response) => {
-                    tracing::info!(target: "rig",
-                        "OpenAI embedding token usage: {}",
-                        response.usage
-                    );
+            match response.status() {
+                StatusCode::OK => {
+                    // Success case
+                    match response.json::<ApiResponse<EmbeddingResponse>>().await? {
+                        ApiResponse::Ok(response_data) => {
+                            tracing::info!(target: "rig",
+                                "OpenAI embedding token usage: {}",
+                                response_data.usage
+                            );
 
-                    if response.data.len() != documents.len() {
-                        return Err(EmbeddingError::ResponseError(
-                            "Response data length does not match input length".into(),
-                        ));
+                            if response_data.data.len() != documents_vec.len() {
+                                return Err(EmbeddingError::ResponseError(
+                                    "Response data length does not match input length".into(),
+                                ));
+                            }
+
+                            return Ok(response_data
+                                .data
+                                .into_iter()
+                                .zip(documents_vec.into_iter()) // Use the original vec here
+                                .map(|(embedding, document)| embeddings::Embedding {
+                                    document,
+                                    vec: embedding.embedding,
+                                })
+                                .collect());
+                        }
+                        ApiResponse::Err(err) => {
+                            return Err(EmbeddingError::ProviderError(err.message))
+                        }
                     }
-
-                    Ok(response
-                        .data
-                        .into_iter()
-                        .zip(documents.into_iter())
-                        .map(|(embedding, document)| embeddings::Embedding {
-                            document,
-                            vec: embedding.embedding,
-                        })
-                        .collect())
                 }
-                ApiResponse::Err(err) => Err(EmbeddingError::ProviderError(err.message)),
+                StatusCode::TOO_MANY_REQUESTS => {
+                    // Rate limit exceeded, extract retry duration and wait
+                    let retry_after = response
+                        .headers()
+                        .get("x-ratelimit-reset-requests")
+                        .or_else(|| response.headers().get("x-ratelimit-reset-tokens"))
+                        .and_then(parse_ratelimit_duration);
+
+                    if let Some(duration) = retry_after {
+                        tracing::warn!(target: "rig",
+                            "Rate limit hit for OpenAI embeddings. Retrying after {:?}",
+                            duration
+                        );
+                        sleep(duration).await;
+                        continue; // Retry the request
+                    } else {
+                        // Header not found or couldn't parse, return error
+                        let error_text = response.text().await?;
+                        tracing::error!(target: "rig",
+                            "Rate limit hit for OpenAI embeddings, but couldn't parse retry duration. Response: {}",
+                            error_text
+                        );
+                        return Err(EmbeddingError::ProviderError(format!(
+                            "Rate limit hit, but no valid retry duration found in headers. Response: {}",
+                            error_text
+                        )));
+                    }
+                }
+                status => {
+                    // Other error status codes
+                    let error_text = response.text().await?;
+                    tracing::error!(target: "rig",
+                        "OpenAI embedding request failed with status {}: {}",
+                        status, error_text
+                    );
+                    return Err(EmbeddingError::ProviderError(format!(
+                        "Request failed with status {}: {}",
+                        status, error_text
+                    )));
+                }
             }
-        } else {
-            Err(EmbeddingError::ProviderError(response.text().await?))
         }
     }
+}
+
+/// Parses OpenAI's rate limit duration string (e.g., "6m10s", "500ms", "1s") into a Duration.
+fn parse_ratelimit_duration(header_value: &HeaderValue) -> Option<Duration> {
+    header_value.to_str().ok().and_then(|s| {
+        let mut total_duration = Duration::ZERO;
+        let mut current_value = String::new();
+
+        for c in s.chars() {
+            if c.is_ascii_digit() {
+                current_value.push(c);
+            } else if c.is_alphabetic() {
+                if let Ok(val) = current_value.parse::<u64>() {
+                    match c {
+                        'h' => total_duration += Duration::from_secs(val * 3600),
+                        'm' => {
+                            // Check if the next char is 's' for 'ms'
+                            if s.chars().skip_while(|&x| x != 'm').nth(1) == Some('s') {
+                                // Skip 's' processing later
+                            } else {
+                                total_duration += Duration::from_secs(val * 60);
+                            }
+                        }
+                        's' => {
+                            // Check if previous char was 'm' for 'ms'
+                            if s.chars().rev().skip_while(|&x| x != 's').nth(1) == Some('m') {
+                                total_duration += Duration::from_millis(val);
+                            } else {
+                                total_duration += Duration::from_secs(val);
+                            }
+                        }
+                        _ => { /* ignore unknown units */ }
+                    }
+                    current_value.clear();
+                } else {
+                    // Failed to parse number part
+                    return None;
+                }
+            }
+        }
+
+        if total_duration == Duration::ZERO {
+            None // No valid units found or parsed
+        } else {
+            Some(total_duration)
+        }
+    })
 }
 
 impl EmbeddingModel {
